@@ -1,8 +1,4 @@
-use crate::raid::Raid;
-
-pub struct AnalysisContext {
-    raid: Raid,
-}
+pub struct AnalysisContext {}
 
 pub trait Analyzer {
     type Output;

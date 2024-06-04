@@ -1,41 +1,88 @@
-use crate::raid::{Event, Room};
-use futures::{StreamExt, TryStreamExt};
-use mongodb::{bson::doc, options::FindOptions, Client};
+use std::env;
+
+use data_repository::{DataRepository, FilesystemBackend};
 
 mod analyzers;
-mod raid;
+mod data_repository;
+
+mod blert {
+    include!(concat!(env!("OUT_DIR"), "/blert.rs"));
+}
 
 #[tokio::main]
 async fn main() {
-    let uri = std::env::args()
+    let uuid = std::env::args()
         .nth(1)
         .expect("expected URI as first argument");
 
-    let client = Client::with_uri_str(&uri).await.expect("Failed to connect");
-    let events = client.database("test").collection::<Event>("roomevents");
+    let repository = initialize_data_repository().expect("Failed to initialize data repository");
 
-    let raid_id = std::env::args()
-        .nth(2)
-        .expect("expected raid ID as second argument");
-
-    let cursor = events
-        .find(
-            doc! { "raidId": raid_id, "room": "MAIDEN" },
-            FindOptions::builder().sort(doc! { "tick": 1 }).build(),
-        )
+    let challenge_data = repository
+        .load_challenge(&uuid)
         .await
-        .unwrap();
+        .expect("Failed to load challenge");
 
-    let maiden_events: Vec<Event> = cursor.try_collect::<Vec<_>>().await.unwrap();
-    let event = maiden_events
-        .iter()
-        .filter_map(|e| match e {
-            Event::NpcUpdate(e) => Some(e),
-            _ => None,
-        })
-        .find(|&e| matches!(e.npc, raid::event::Npc::MaidenCrab { .. }));
-
-    if let Some(e) = event {
-        println!("{e:?}");
+    println!("Loaded challenge data for {}", challenge_data.challenge_id);
+    match challenge_data.stage_data {
+        Some(blert::challenge_data::StageData::TobRooms(rooms)) => {
+            println!("  Type: Theatre of Blood");
+            if let Some(maiden) = rooms.maiden {
+                let events = repository
+                    .load_stage_events(&uuid, maiden.stage())
+                    .await
+                    .unwrap();
+                println!("  Maiden: yes ({})", events.events.len());
+            }
+            if let Some(bloat) = rooms.bloat {
+                let events = repository
+                    .load_stage_events(&uuid, bloat.stage())
+                    .await
+                    .unwrap();
+                println!("  Bloat: yes ({})", events.events.len());
+            }
+            if let Some(nylocas) = rooms.nylocas {
+                let events = repository
+                    .load_stage_events(&uuid, nylocas.stage())
+                    .await
+                    .unwrap();
+                println!("  Nylocas: yes ({})", events.events.len());
+            }
+            if let Some(sotetseg) = rooms.sotetseg {
+                let events = repository
+                    .load_stage_events(&uuid, sotetseg.stage())
+                    .await
+                    .unwrap();
+                println!("  Sotetseg: yes ({})", events.events.len());
+            }
+            if let Some(xarpus) = rooms.xarpus {
+                let events = repository
+                    .load_stage_events(&uuid, xarpus.stage())
+                    .await
+                    .unwrap();
+                println!("  Xarpus: yes ({})", events.events.len());
+            }
+            if let Some(verzik) = rooms.verzik {
+                let events = repository
+                    .load_stage_events(&uuid, verzik.stage())
+                    .await
+                    .unwrap();
+                println!("  Verzik: yes ({})", events.events.len());
+            }
+        }
+        Some(blert::challenge_data::StageData::Colosseum(_)) => println!("  Type: Colosseum"),
+        None => todo!(),
     }
+}
+
+fn initialize_data_repository() -> Result<data_repository::DataRepository, ()> {
+    let uri = env::var("BLERT_DATA_REPOSITORY").expect("BLERT_DATA_REPOSITORY not set");
+
+    let backend = match uri.split_once("://") {
+        Some(("file", path)) => FilesystemBackend::new(std::path::Path::new(path)),
+        Some(("s3", _)) => unimplemented!(),
+        Some((_, _)) => panic!("Invalid data repository URI"),
+        None => panic!("Invalid data repository URI"),
+    };
+
+    Ok(DataRepository::new(Box::new(backend)))
 }
