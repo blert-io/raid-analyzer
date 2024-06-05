@@ -1,87 +1,64 @@
+#![warn(clippy::pedantic)]
+
+use challenge::Challenge;
 use std::env;
+use uuid::Uuid;
 
 use data_repository::{DataRepository, FilesystemBackend};
+use error::{Error, Result};
 
-mod analyzers;
+mod analysis;
+mod challenge;
 mod data_repository;
+mod error;
 
 mod blert {
+    #![allow(clippy::all)]
     include!(concat!(env!("OUT_DIR"), "/blert.rs"));
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let uuid = std::env::args()
         .nth(1)
-        .expect("expected URI as first argument");
+        .map(|s| Uuid::parse_str(&s).unwrap())
+        .expect("expected UUID as first argument");
 
-    let repository = initialize_data_repository().expect("Failed to initialize data repository");
+    let repository = initialize_data_repository()?;
+    let database_pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&env::var("BLERT_DATABASE_URI").expect("BLERT_DATABASE_URI not set"))
+        .await?;
 
-    let challenge_data = repository
-        .load_challenge(&uuid)
-        .await
-        .expect("Failed to load challenge");
+    let challenge = Challenge::load(&database_pool, &repository, uuid).await?;
+    let ctx = analysis::Context::new(analysis::Level::Basic, challenge);
+    println!(
+        "Challenge {}:\n{}",
+        ctx.challenge().uuid(),
+        ctx.challenge().status(),
+    );
+    println!("{}", ctx.challenge().party().join(", "));
 
-    println!("Loaded challenge data for {}", challenge_data.challenge_id);
-    match challenge_data.stage_data {
-        Some(blert::challenge_data::StageData::TobRooms(rooms)) => {
-            println!("  Type: Theatre of Blood");
-            if let Some(maiden) = rooms.maiden {
-                let events = repository
-                    .load_stage_events(&uuid, maiden.stage())
-                    .await
-                    .unwrap();
-                println!("  Maiden: yes ({})", events.events.len());
-            }
-            if let Some(bloat) = rooms.bloat {
-                let events = repository
-                    .load_stage_events(&uuid, bloat.stage())
-                    .await
-                    .unwrap();
-                println!("  Bloat: yes ({})", events.events.len());
-            }
-            if let Some(nylocas) = rooms.nylocas {
-                let events = repository
-                    .load_stage_events(&uuid, nylocas.stage())
-                    .await
-                    .unwrap();
-                println!("  Nylocas: yes ({})", events.events.len());
-            }
-            if let Some(sotetseg) = rooms.sotetseg {
-                let events = repository
-                    .load_stage_events(&uuid, sotetseg.stage())
-                    .await
-                    .unwrap();
-                println!("  Sotetseg: yes ({})", events.events.len());
-            }
-            if let Some(xarpus) = rooms.xarpus {
-                let events = repository
-                    .load_stage_events(&uuid, xarpus.stage())
-                    .await
-                    .unwrap();
-                println!("  Xarpus: yes ({})", events.events.len());
-            }
-            if let Some(verzik) = rooms.verzik {
-                let events = repository
-                    .load_stage_events(&uuid, verzik.stage())
-                    .await
-                    .unwrap();
-                println!("  Verzik: yes ({})", events.events.len());
-            }
-        }
-        Some(blert::challenge_data::StageData::Colosseum(_)) => println!("  Type: Colosseum"),
-        None => todo!(),
-    }
+    ctx.challenge().stages().for_each(|stage| {
+        println!(
+            "  - {:4} events for {:?}",
+            ctx.challenge()
+                .stage_events(stage)
+                .map_or(0, <[blert::Event]>::len),
+            stage,
+        );
+    });
+
+    Ok(())
 }
 
-fn initialize_data_repository() -> Result<data_repository::DataRepository, ()> {
-    let uri = env::var("BLERT_DATA_REPOSITORY").expect("BLERT_DATA_REPOSITORY not set");
+fn initialize_data_repository() -> Result<data_repository::DataRepository> {
+    let uri = env::var("BLERT_DATA_REPOSITORY")
+        .map_err(|_| Error::Environment("BLERT_DATA_REPOSITORY"))?;
 
     let backend = match uri.split_once("://") {
         Some(("file", path)) => FilesystemBackend::new(std::path::Path::new(path)),
         Some(("s3", _)) => unimplemented!(),
-        Some((_, _)) => panic!("Invalid data repository URI"),
-        None => panic!("Invalid data repository URI"),
+        Some((_, _)) | None => return Err(Error::Environment("BLERT_DATA_REPOSITORY")),
     };
 
     Ok(DataRepository::new(Box::new(backend)))

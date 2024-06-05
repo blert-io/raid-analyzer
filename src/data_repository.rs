@@ -4,43 +4,45 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
 };
+use uuid::Uuid;
 
 use crate::blert;
 
 pub struct DataRepository {
-    backend: Box<dyn DataRepositoryBackend + Sync>,
+    backend: Box<dyn Backend + Sync>,
 }
 
 impl DataRepository {
     const CHALLENGE_FILE_NAME: &'static str = "challenge";
 
-    pub fn new(backend: Box<dyn DataRepositoryBackend + Sync>) -> Self {
+    pub fn new(backend: Box<dyn Backend + Sync>) -> Self {
         Self { backend }
     }
 
-    pub async fn load_challenge(&self, uuid: &str) -> Result<blert::ChallengeData, Error> {
+    pub async fn load_challenge(&self, uuid: Uuid) -> Result<blert::ChallengeData, Error> {
         let data = self
             .backend
-            .read_file(self.relative_path(uuid, Self::CHALLENGE_FILE_NAME))
+            .read_file(Self::relative_path(uuid, Self::CHALLENGE_FILE_NAME))
             .await?;
         blert::ChallengeData::decode(&mut Cursor::new(&data)).map_err(Error::from)
     }
 
     pub async fn load_stage_events(
         &self,
-        uuid: &str,
+        uuid: Uuid,
         stage: blert::Stage,
     ) -> Result<blert::ChallengeEvents, Error> {
         let file_name = self.stage_file_name(stage);
         let raw = self
             .backend
-            .read_file(self.relative_path(uuid, file_name))
+            .read_file(Self::relative_path(uuid, file_name))
             .await?;
         blert::ChallengeEvents::decode(&mut Cursor::new(&raw)).map_err(Error::from)
     }
 
     /// Returns the relative path to a file from the root of the repository.
-    fn relative_path(&self, uuid: &str, file_name: &str) -> String {
+    fn relative_path(uuid: Uuid, file_name: &str) -> String {
+        let uuid = uuid.to_string();
         format!("{}/{}/{}", &uuid[0..2], uuid.replace('-', ""), file_name)
     }
 
@@ -93,7 +95,7 @@ impl DataRepository {
 
 #[derive(Debug)]
 pub enum Error {
-    NotFound,
+    NotFound(String),
     Decode(prost::DecodeError),
 }
 
@@ -104,7 +106,7 @@ impl From<prost::DecodeError> for Error {
 }
 
 #[async_trait::async_trait]
-pub trait DataRepositoryBackend {
+pub trait Backend {
     async fn read_file(&self, relative_path: String) -> Result<Vec<u8>, Error>;
 }
 
@@ -122,9 +124,9 @@ impl FilesystemBackend {
 }
 
 #[async_trait::async_trait]
-impl DataRepositoryBackend for FilesystemBackend {
+impl Backend for FilesystemBackend {
     async fn read_file(&self, relative_path: String) -> Result<Vec<u8>, Error> {
         let full_path = self.root.join(relative_path);
-        fs::read(full_path).map_err(|_| Error::NotFound)
+        fs::read(&full_path).map_err(|_| Error::NotFound(full_path.to_string_lossy().into()))
     }
 }
