@@ -1,4 +1,5 @@
 #![warn(clippy::pedantic)]
+#![allow(clippy::cast_possible_truncation)]
 
 use challenge::Challenge;
 use std::env;
@@ -8,6 +9,7 @@ use data_repository::{DataRepository, FilesystemBackend};
 use error::{Error, Result};
 
 mod analysis;
+mod analyzers;
 mod challenge;
 mod data_repository;
 mod error;
@@ -42,8 +44,8 @@ async fn main() -> Result<()> {
         println!(
             "  - {:4} events for {:?}",
             ctx.challenge()
-                .stage_events(stage)
-                .map_or(0, <[blert::Event]>::len),
+                .stage_info(stage)
+                .map_or(0, challenge::StageInfo::total_events),
             stage,
         );
     });

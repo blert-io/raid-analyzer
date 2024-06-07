@@ -1,6 +1,7 @@
 use std::any::Any;
 
 use crate::challenge::Challenge;
+use crate::error::Result;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Level {
@@ -48,7 +49,7 @@ pub trait Analyzer {
     /// Returns a globally unique name for the analyzer.
     fn name(&self) -> &str;
 
-    fn analyze(&self, context: &Context) -> Result<Self::Output, ()>;
+    fn analyze(&self, context: &Context) -> Result<Self::Output>;
 }
 
 struct ResolvedAnalyzer<A: Analyzer> {

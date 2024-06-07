@@ -6,6 +6,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     Environment(&'static str),
     InvalidField(String),
+    IncompleteData,
     DataRepository(data_repository::Error),
     Sql(sqlx::Error),
 }
