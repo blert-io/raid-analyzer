@@ -21,6 +21,8 @@ mod blert {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
+
     let uuid = std::env::args()
         .nth(1)
         .map(|s| Uuid::parse_str(&s).unwrap())
@@ -31,24 +33,14 @@ async fn main() -> Result<()> {
         .connect(&env::var("BLERT_DATABASE_URI").expect("BLERT_DATABASE_URI not set"))
         .await?;
 
-    let challenge = Challenge::load(&database_pool, &repository, uuid).await?;
-    let ctx = analysis::Context::new(analysis::Level::Basic, challenge);
-    println!(
-        "Challenge {}:\n{}",
-        ctx.challenge().uuid(),
-        ctx.challenge().status(),
-    );
-    println!("{}", ctx.challenge().party().join(", "));
+    let mut analysis_engine = analysis::Engine::load_from_directory("./programs").await?;
+    analysis_engine.start(8);
 
-    ctx.challenge().stages().for_each(|stage| {
-        println!(
-            "  - {:4} events for {:?}",
-            ctx.challenge()
-                .stage_info(stage)
-                .map_or(0, challenge::StageInfo::total_events),
-            stage,
-        );
-    });
+    let challenge = Challenge::load(&database_pool, &repository, uuid).await?;
+
+    analysis_engine
+        .run_program("analysis_test", analysis::Level::Basic, challenge)
+        .await?;
 
     Ok(())
 }

@@ -6,8 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-channel = "2.3.1"
 async-trait = "0.1.80"
+env_logger = "0.11.3"
 futures = "0.3.30"
+log = "0.4.21"
 prost = "0.12.6"
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.114"
@@ -21,6 +24,7 @@ sqlx = { version = "0.7.4", features = [
     "time",
 ] }
 tokio = { version = "1.36.0", features = ["full"] }
+toml = "0.8.14"
 uuid = "1.8.0"
 
 [build-dependencies]

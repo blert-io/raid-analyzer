@@ -220,7 +220,7 @@ impl StageInfo {
                             Some((e, player))
                         }
                         (true, None) => {
-                            eprintln!("Player event without player data: {e:?}");
+                            log::error!("Player event without player data: {e:?}");
                             None
                         }
                         _ => None,
@@ -266,7 +266,7 @@ impl StageInfo {
                                         Ok(())
                                     }
                                     Err(e) => {
-                                        eprintln!("Error parsing item delta: {e}");
+                                        log::error!("Error parsing item delta: {e}");
                                         Err(Error::InvalidField(format!("PlayerUpdateEvent({username}:{tick}): equipment_deltas")))
                                     }
                                 })

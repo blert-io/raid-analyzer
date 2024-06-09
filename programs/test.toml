@@ -1,0 +1,12 @@
+[program]
+name = "analysis_test"
+analyzers = ["test_analyzer_2", "gear_analyzer"]
+
+[analyzers.TestAnalyzer]
+implementation = "TestAnalyzer"
+config = { value = 5 }
+
+[analyzers.TestOffsetAnalyzer]
+implementation = "TestOffsetAnalyzer"
+dependencies = ["TestAnalyzer"]
+config = { "offset" = 4 }

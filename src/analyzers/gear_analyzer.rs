@@ -1,7 +1,7 @@
-use crate::analysis::Analyzer;
+use crate::analysis::{Analyzer, Context};
 use crate::error::{Error, Result};
 
-struct GearAnalyzer {}
+pub struct GearAnalyzer {}
 
 impl Analyzer for GearAnalyzer {
     type Output = ();
@@ -10,7 +10,7 @@ impl Analyzer for GearAnalyzer {
         "GearAnalyzer"
     }
 
-    fn analyze(&self, context: &crate::analysis::Context) -> Result<Self::Output> {
+    fn analyze(&self, context: &Context) -> Result<Self::Output> {
         let challenge = context.challenge();
 
         for stage in challenge.stage_infos() {
