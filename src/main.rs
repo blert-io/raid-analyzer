@@ -1,5 +1,9 @@
 #![warn(clippy::pedantic)]
-#![allow(clippy::cast_possible_truncation)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 
 use axum::Router;
 use std::{
@@ -17,6 +21,8 @@ mod api;
 mod challenge;
 mod data_repository;
 mod error;
+mod item;
+mod npc;
 
 mod blert {
     #![allow(clippy::all)]
@@ -35,14 +41,17 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::builder().format_timestamp_micros().init();
 
     let repository = initialize_data_repository().await?;
     let database_pool = sqlx::postgres::PgPoolOptions::new()
         .connect(&var("BLERT_DATABASE_URI")?)
         .await?;
 
-    let mut analysis_engine = analysis::Engine::load_from_directory("./programs").await?;
+    let item_registry = item::Registry::load_from_file("resources/runescape_items.json")?;
+
+    let mut analysis_engine =
+        analysis::Engine::load_from_directory("./programs", item_registry).await?;
     analysis_engine.start(8);
 
     let state = Arc::new(AppState {

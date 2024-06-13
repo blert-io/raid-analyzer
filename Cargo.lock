@@ -1892,6 +1892,7 @@ dependencies = [
  "log",
  "prost",
  "prost-build",
+ "rand",
  "serde",
  "serde_json",
  "serde_repr",

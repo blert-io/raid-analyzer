@@ -2,9 +2,9 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use futures::future::{self, TryFutureExt};
-use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::sync::mpsc;
@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use crate::analyzers::init_analyzer;
 use crate::challenge::Challenge;
 use crate::error::{Error, Result};
+use crate::item;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Level {
@@ -36,6 +37,7 @@ pub enum Level {
 /// An analysis `Context` provides information about the active analysis program run.
 pub struct Context {
     challenge: Arc<Challenge>,
+    item_registry: Arc<item::Registry>,
     level: Level,
     completed_analyzers: Arc<RwLock<HashMap<String, Box<dyn RunnableAnalyzer>>>>,
 }
@@ -43,11 +45,13 @@ pub struct Context {
 impl Context {
     fn new(
         challenge: Arc<Challenge>,
+        item_registry: Arc<item::Registry>,
         level: Level,
         completed_analyzers: Arc<RwLock<HashMap<String, Box<dyn RunnableAnalyzer>>>>,
     ) -> Self {
         Self {
             challenge,
+            item_registry,
             level,
             completed_analyzers,
         }
@@ -63,6 +67,11 @@ impl Context {
         &self.challenge
     }
 
+    /// Returns a registry of all known game items.
+    pub fn item_registry(&self) -> &item::Registry {
+        &self.item_registry
+    }
+
     /// Returns the output of a dependency of the current analyzer.
     /// If the dependency is optional, may return `None`.
     pub fn get_dependency_output<A: Analyzer + 'static>(&self) -> Option<Arc<A::Output>> {
@@ -73,7 +82,7 @@ impl Context {
             .find_map(|a| {
                 a.as_any()
                     .downcast_ref::<AnalyzerRun<A>>()
-                    .and_then(|a| a.output.as_ref().cloned())
+                    .and_then(|a| a.output.clone())
             })
     }
 }
@@ -158,6 +167,7 @@ struct ProgramRun {
     pending: BTreeMap<String, Box<dyn RunnableAnalyzer>>,
     completed: Arc<RwLock<HashMap<String, Box<dyn RunnableAnalyzer>>>>,
     challenge: Arc<Challenge>,
+    item_registry: Arc<item::Registry>,
 }
 
 impl ProgramRun {
@@ -167,6 +177,7 @@ impl ProgramRun {
         level: Level,
         dispatch_tx: async_channel::Sender<WorkerRunRequest>,
         challenge: Challenge,
+        item_registry: Arc<item::Registry>,
     ) -> Self {
         let (notify_tx, notify_rx) = mpsc::channel(8);
         let analyzers_to_run = program.analyzers.len() as u32;
@@ -183,6 +194,7 @@ impl ProgramRun {
             pending: BTreeMap::new(),
             completed: Arc::new(RwLock::new(HashMap::new())),
             challenge: Arc::new(challenge),
+            item_registry,
         }
     }
 
@@ -201,7 +213,6 @@ impl ProgramRun {
                 return Err(e);
             }
 
-            log::debug!(r#"Analyzer "{}" completed"#, response.analyzer.name());
             self.handle_completed(response.analyzer);
             self.schedule_all_pending().await?;
             self.analyzers_to_run -= 1;
@@ -253,14 +264,19 @@ impl ProgramRun {
         future::try_join_all(pending.into_values().map(|analyzer| {
             let request = WorkerRunRequest {
                 analyzer,
-                context: Context::new(self.challenge.clone(), self.level, self.completed.clone()),
+                context: Context::new(
+                    self.challenge.clone(),
+                    self.item_registry.clone(),
+                    self.level,
+                    self.completed.clone(),
+                ),
                 notify_tx: self.notify_tx.clone(),
             };
 
             log::debug!(r#"Scheduled analyzer "{}" to run"#, request.analyzer.name());
             self.dispatch_tx
                 .send(request)
-                .map_err(|_| Error::NotRunning)
+                .map_err(|_| Error::FailedPrecondition("Worker channel closed".into()))
         }))
         .await?;
 
@@ -293,6 +309,7 @@ impl std::fmt::Debug for ProgramRun {
                 &self.completed.try_read().map(|r| r.len()).unwrap_or(0),
             )
             .field("challenge", &self.challenge)
+            .field("item_registry", &self.item_registry)
             .finish()
     }
 }
@@ -302,11 +319,15 @@ pub struct Engine {
     workers: Vec<JoinHandle<()>>,
     dispatch_tx: Option<async_channel::Sender<WorkerRunRequest>>,
     num_programs_run: u32,
+    item_registry: Arc<item::Registry>,
 }
 
 impl Engine {
     /// Loads analysis programs defined in TOML files from the directory at `path`.
-    pub async fn load_from_directory(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn load_from_directory(
+        path: impl AsRef<Path>,
+        item_registry: item::Registry,
+    ) -> Result<Self> {
         let mut programs = HashMap::new();
         let mut dir = fs::read_dir(path).await?;
 
@@ -329,6 +350,7 @@ impl Engine {
             workers: Vec::new(),
             dispatch_tx: None,
             num_programs_run: 0,
+            item_registry: Arc::new(item_registry),
         })
     }
 
@@ -352,7 +374,7 @@ impl Engine {
 
         let dispatch_tx = match &self.dispatch_tx {
             Some(tx) => tx.clone(),
-            None => return Err(Error::NotRunning),
+            None => return Err(Error::FailedPrecondition("Engine not started".into())),
         };
 
         log::info!(
@@ -362,16 +384,35 @@ impl Engine {
         );
 
         self.num_programs_run += 1;
-
         let run_number = self.num_programs_run;
 
-        let mut program_run =
-            ProgramRun::new(program.clone(), run_number, level, dispatch_tx, challenge);
+        let mut program_run = ProgramRun::new(
+            program.clone(),
+            run_number,
+            level,
+            dispatch_tx,
+            challenge,
+            self.item_registry.clone(),
+        );
 
         tokio::spawn(async move {
-            let result = program_run.run().await;
-            if let Err(e) = result {
-                log::error!(r#"Program "{}" failed: {e:?}"#, program_run.program_name());
+            let run_start = Instant::now();
+
+            match program_run.run().await {
+                Ok(()) => {
+                    log::debug!(
+                        r#"Program "{}" completed in {:?}"#,
+                        program_run.program_name(),
+                        run_start.elapsed(),
+                    );
+                }
+                Err(e) => {
+                    log::error!(
+                        r#"Program "{}" failed in {:?}: {e:?}"#,
+                        program_run.program_name(),
+                        run_start.elapsed()
+                    );
+                }
             }
         });
 
@@ -401,8 +442,16 @@ impl Worker {
                 self.id,
                 request.analyzer.name(),
             );
+            let start = Instant::now();
 
             let result = request.analyzer.run(&request.context);
+
+            log::debug!(
+                r#"Worker {} completed analyzer "{}" in {:?}"#,
+                self.id,
+                request.analyzer.name(),
+                start.elapsed(),
+            );
 
             request
                 .notify_tx
@@ -425,7 +474,6 @@ struct ProgramConfig {
 #[derive(Debug, Serialize, Deserialize)]
 struct ProgramDefinition {
     name: String,
-    analyzers: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

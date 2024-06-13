@@ -34,6 +34,7 @@ impl Analyzer for TestOffsetAnalyzer {
         let value = context
             .get_dependency_output::<TestAnalyzer>()
             .map_or_else(|| self.offset, |v| *v + self.offset);
+        log::debug!("TestOffsetAnalyzer output {value}");
         Ok(value)
     }
 }

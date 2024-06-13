@@ -1,0 +1,9 @@
+[program]
+name = "tob_basic"
+
+[analyzers.GearAnalyzer]
+implementation = "GearAnalyzer"
+
+[analyzers.TobRoleAnalyzer]
+implementation = "TobRoleAnalyzer"
+dependencies = ["GearAnalyzer"]

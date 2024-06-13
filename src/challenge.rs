@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use futures::future::{self, FutureExt};
 use uuid::Uuid;
@@ -7,6 +7,7 @@ use crate::{
     blert,
     data_repository::DataRepository,
     error::{Error, Result},
+    item::{self, EquipmentSlot},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,6 +46,8 @@ impl TryFrom<i16> for Status {
 #[derive(Debug)]
 pub struct Challenge {
     uuid: Uuid,
+    r#type: blert::Challenge,
+    mode: blert::ChallengeMode,
     status: Status,
     stage: blert::Stage,
     party: Vec<String>,
@@ -79,6 +82,16 @@ impl Challenge {
 
         let challenge_data = repository.load_challenge(uuid).await?;
 
+        let r#type = blert::Challenge::try_from(i32::from(challenge.r#type))
+            .map_err(|_| Error::InvalidField("type".to_string()))?;
+
+        let mode = challenge
+            .mode
+            .ok_or_else(|| Error::InvalidField("mode".to_string()))
+            .map(i32::from)?;
+        let mode = blert::ChallengeMode::try_from(mode)
+            .map_err(|_| Error::InvalidField("mode".to_string()))?;
+
         let first_stage = match blert::Challenge::try_from(i32::from(challenge.r#type)) {
             Ok(blert::Challenge::Tob) => blert::Stage::TobMaiden as i16,
             Ok(blert::Challenge::Colosseum) => blert::Stage::ColosseumWave1 as i16,
@@ -97,14 +110,17 @@ impl Challenge {
         let stages = future::try_join_all((first_stage..=challenge_stage as i16).map(|stage| {
             let stage =
                 blert::Stage::try_from(i32::from(stage)).expect("Stage is within the valid range");
-            repository
-                .load_stage_events(uuid, stage)
-                .map(|res| res.map_err(Error::from).and_then(StageInfo::new))
+            repository.load_stage_events(uuid, stage).map(|res| {
+                res.map_err(Error::from)
+                    .and_then(|s| StageInfo::new(&challenge_data, s))
+            })
         }))
         .await?;
 
         Ok(Challenge {
             uuid,
+            r#type,
+            mode,
             status: challenge
                 .status
                 .ok_or(Error::InvalidField("status".to_string()))
@@ -121,14 +137,33 @@ impl Challenge {
         self.uuid
     }
 
+    /// Returns the type of the challenge.
+    pub fn r#type(&self) -> blert::Challenge {
+        self.r#type
+    }
+
+    /// Returns the mode of the challenge.
+    pub fn mode(&self) -> blert::ChallengeMode {
+        self.mode
+    }
+
     /// Returns the status of the challenge.
     pub fn status(&self) -> Status {
         self.status
     }
 
+    /// Returns the number of players in the challenge.
+    pub fn scale(&self) -> usize {
+        self.party.len()
+    }
+
     /// Returns the list of players in the challenge, in orb order.
     pub fn party(&self) -> &[String] {
         self.party.as_slice()
+    }
+
+    pub fn stage(&self) -> blert::Stage {
+        self.stage
     }
 
     /// Returns an iterator over the stages of the challenge.
@@ -147,14 +182,6 @@ impl Challenge {
     }
 }
 
-#[derive(Debug)]
-pub struct StageInfo {
-    stage: blert::Stage,
-    events_by_tick: Vec<Vec<blert::Event>>,
-    total_events: usize,
-    player_state: HashMap<String, Vec<Option<PlayerState>>>,
-}
-
 fn is_player_event(event: &blert::Event) -> bool {
     matches!(
         event.r#type(),
@@ -164,46 +191,123 @@ fn is_player_event(event: &blert::Event) -> bool {
     )
 }
 
+#[derive(Debug)]
+struct StageEvents {
+    total_ticks: u32,
+    all: Vec<blert::Event>,
+    tick_indices: Vec<i32>,
+    by_type: HashMap<blert::event::Type, Vec<usize>>,
+}
+
+impl StageEvents {
+    pub fn for_tick(&self, tick: u32) -> &[blert::Event] {
+        let start_index = self.tick_indices[tick as usize];
+        if start_index < 0 {
+            return &[];
+        }
+        let start_index = start_index as usize;
+
+        let end_index = if tick > self.total_ticks {
+            self.all.len()
+        } else {
+            self.tick_indices[tick as usize + 1] as usize
+        };
+
+        &self.all[start_index..end_index]
+    }
+}
+
+#[derive(Debug)]
+pub struct StageInfo {
+    stage: blert::Stage,
+    events: StageEvents,
+    player_state: HashMap<String, Vec<Option<PlayerState>>>,
+    npcs: HashMap<u64, Arc<blert::challenge_data::StageNpc>>,
+}
+
 impl StageInfo {
-    fn new(stage_data: blert::ChallengeEvents) -> Result<Self> {
+    fn new(
+        challenge_data: &blert::ChallengeData,
+        stage_data: blert::ChallengeEvents,
+    ) -> Result<Self> {
         let stage = stage_data.stage();
         let mut events = stage_data.events;
         events.sort_by(|a, b| a.tick.cmp(&b.tick));
         let last_tick = events.last().map_or(0, |e| e.tick);
 
-        let mut events_by_tick = vec![Vec::new(); last_tick as usize + 1];
-        let mut total_events = 0;
+        let mut events = StageEvents {
+            total_ticks: last_tick,
+            all: events,
+            tick_indices: vec![-1; last_tick as usize + 1],
+            by_type: HashMap::new(),
+        };
 
-        for event in events {
-            events_by_tick[event.tick as usize].push(event);
-            total_events += 1;
+        let mut previous_tick = -1;
+
+        for (i, event) in events.all.iter().enumerate() {
+            if event.tick as i32 != previous_tick {
+                events.tick_indices[event.tick as usize] = i as i32;
+                previous_tick = event.tick as i32;
+            }
+
+            events.by_type.entry(event.r#type()).or_default().push(i);
         }
 
-        let player_state = Self::build_player_state(&stage_data.party_names, &events_by_tick)?;
+        // Pull the raw NPC data for the stage from the proto and convert it to a map of room IDs
+        // to NPCs.
+        let npcs = challenge_data
+            .stage_data
+            .as_ref()
+            .and_then(|data| match data {
+                blert::challenge_data::StageData::TobRooms(rooms) => match stage {
+                    blert::Stage::TobMaiden => rooms.maiden.as_ref().map(|r| &r.npcs),
+                    blert::Stage::TobBloat => rooms.bloat.as_ref().map(|r| &r.npcs),
+                    blert::Stage::TobNylocas => rooms.nylocas.as_ref().map(|r| &r.npcs),
+                    blert::Stage::TobSotetseg => rooms.sotetseg.as_ref().map(|r| &r.npcs),
+                    blert::Stage::TobXarpus => rooms.xarpus.as_ref().map(|r| &r.npcs),
+                    blert::Stage::TobVerzik => rooms.verzik.as_ref().map(|r| &r.npcs),
+                    _ => None,
+                },
+                blert::challenge_data::StageData::Colosseum(colo) => colo
+                    .waves
+                    .get(stage as usize - blert::Stage::ColosseumWave1 as usize)
+                    .map(|wave| &wave.npcs),
+            });
+        let npcs = npcs
+            .map(|npcs| {
+                npcs.iter()
+                    .map(|npc| (npc.room_id, Arc::new(npc.clone())))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        let player_state = Self::build_player_state(&stage_data.party_names, &events, &npcs)?;
 
         Ok(Self {
             stage,
-            events_by_tick,
-            total_events,
+            events,
             player_state,
+            npcs,
         })
     }
 
     fn build_player_state(
         party: &[String],
-        events_by_tick: &Vec<Vec<blert::Event>>,
+        events: &StageEvents,
+        npcs: &HashMap<u64, Arc<blert::challenge_data::StageNpc>>,
     ) -> Result<HashMap<String, Vec<Option<PlayerState>>>> {
         let mut player_state = HashMap::new();
 
         for (index, username) in party.iter().enumerate() {
-            let mut state_by_tick = Vec::with_capacity(events_by_tick.len());
-            state_by_tick.resize_with(events_by_tick.len(), Default::default);
+            let mut state_by_tick = Vec::with_capacity(events.total_ticks as usize);
+            state_by_tick.resize_with(events.total_ticks as usize, Default::default);
             let mut last_known_state: Option<&PlayerState> = None;
 
-            for (tick, events) in events_by_tick.iter().enumerate() {
+            for tick in 0..events.total_ticks {
                 let mut state_this_tick = match last_known_state {
                     Some(s) => s.next_tick(),
                     None => PlayerState {
+                        tick,
                         attack_state: AttackState::Idle,
                         death_state: DeathState::Alive,
                         position: blert::Coords { x: 0, y: 0 },
@@ -214,6 +318,7 @@ impl StageInfo {
                 };
 
                 events
+                    .for_tick(tick)
                     .iter()
                     .filter_map(|e| match (is_player_event(e), &e.player) {
                         (true, Some(player)) if player.party_index as usize == index => {
@@ -228,14 +333,14 @@ impl StageInfo {
                     .try_for_each(|(event, player)| match event.r#type() {
                         blert::event::Type::PlayerAttack => {
                             state_this_tick.attack_state = match &event.player_attack {
-                                Some(atk) => AttackState::Attacked {
+                                Some(atk) => AttackState::Attacked(PlayerAttacked {
                                     attack: atk.r#type(),
-                                    target_id: atk.target.as_ref().map(|npc| npc.room_id),
-                                },
-                                None => AttackState::Attacked {
+                                    target: atk.target.as_ref().and_then(|npc| npcs.get(&npc.room_id)).cloned(),
+                                }),
+                                None => AttackState::Attacked(PlayerAttacked {
                                     attack: blert::PlayerAttack::Unknown,
-                                    target_id: None,
-                                },
+                                    target: None,
+                                }),
                             };
                             Ok(())
                         }
@@ -244,9 +349,9 @@ impl StageInfo {
                             Ok(())
                         }
                         blert::event::Type::PlayerUpdate => {
-                            if state_this_tick.attack_state  == AttackState::Idle && player.off_cooldown_tick > tick as u32 {
+                            if state_this_tick.attack_state  == AttackState::Idle && player.off_cooldown_tick > tick {
                                 state_this_tick.attack_state =
-                                    AttackState::OnCooldown(player.off_cooldown_tick - tick as u32);
+                                    AttackState::OnCooldown(player.off_cooldown_tick - tick);
                             }
 
                             state_this_tick.position = blert::Coords {
@@ -274,8 +379,8 @@ impl StageInfo {
                         _ => unreachable!(),
                     })?;
 
-                state_by_tick[tick] = Some(state_this_tick);
-                last_known_state = state_by_tick[tick].as_ref();
+                state_by_tick[tick as usize] = Some(state_this_tick);
+                last_known_state = state_by_tick[tick as usize].as_ref();
             }
 
             player_state.insert(username.clone(), state_by_tick);
@@ -284,25 +389,50 @@ impl StageInfo {
         Ok(player_state)
     }
 
-    pub fn events_for_tick(&self, tick: u16) -> &[blert::Event] {
-        self.events_by_tick[tick as usize].as_slice()
+    /// Returns the challenge stage whose data is contained.
+    pub fn stage(&self) -> blert::Stage {
+        self.stage
     }
 
+    /// Returns an iterator over every event in the stage.
+    pub fn all_events(&self) -> impl Iterator<Item = &blert::Event> {
+        self.events.all.iter()
+    }
+
+    /// Returns the total number of recorded events in the stage.
     pub fn total_events(&self) -> usize {
-        self.total_events
+        self.events.all.len()
     }
 
-    pub fn player_state(&self, username: &str) -> Option<&[Option<PlayerState>]> {
-        self.player_state.get(username).map(Vec::as_slice)
+    /// Returns an iterator over all events with the specified type.
+    pub fn events_for_type(
+        &self,
+        event_type: blert::event::Type,
+    ) -> impl Iterator<Item = &blert::Event> {
+        self.events
+            .by_type
+            .get(&event_type)
+            .into_iter()
+            .flat_map(move |indices| indices.iter().map(|&i| &self.events.all[i]))
+    }
+
+    /// Returns information about a specific player in the stage.
+    pub fn player_state(&self, username: &str) -> Option<PlayerStates> {
+        self.player_state
+            .get(username)
+            .map(|states| PlayerStates { states })
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PlayerAttacked {
+    pub attack: blert::PlayerAttack,
+    pub target: Option<Arc<blert::challenge_data::StageNpc>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum AttackState {
-    Attacked {
-        attack: blert::PlayerAttack,
-        target_id: Option<u64>,
-    },
+    Attacked(PlayerAttacked),
     OnCooldown(u32),
     Idle,
 }
@@ -326,22 +456,95 @@ pub struct PlayerStats {
 }
 
 #[derive(Debug, Clone)]
+pub struct ItemQuantity(i32, i32);
+
+impl ItemQuantity {
+    pub fn id(&self) -> i32 {
+        self.0
+    }
+
+    pub fn quantity(&self) -> i32 {
+        self.1
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PlayerStates<'a> {
+    states: &'a [Option<PlayerState>],
+}
+
+impl PlayerStates<'_> {
+    /// Returns an iterator over every known player state. As player state may be missing for some
+    /// ticks, the ticks of the iterator may not be sequential.
+    pub fn iter(&self) -> impl Iterator<Item = &PlayerState> {
+        self.states.iter().flatten()
+    }
+
+    /// Returns every attack done by the player with their attack ticks.
+    pub fn attacks(&self) -> impl Iterator<Item = (u32, &PlayerAttacked)> {
+        self.iter().filter_map(|state| match &state.attack_state {
+            AttackState::Attacked(a) => Some((state.tick, a)),
+            _ => None,
+        })
+    }
+
+    /// Returns the player state for a specific tick, if it exists.
+    pub fn get_tick(&self, tick: usize) -> Option<&PlayerState> {
+        self.states.get(tick).and_then(Option::as_ref)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PlayerState {
+    pub tick: u32,
     pub attack_state: AttackState,
     pub death_state: DeathState,
     pub position: blert::Coords,
     pub stats: PlayerStats,
     pub prayers: PrayerSet,
-    equipment: [Option<Item>; 11],
+    equipment: [Option<ItemQuantity>; 11],
 }
 
 impl PlayerState {
-    pub fn equipped_item(&self, slot: EquipmentSlot) -> Option<&Item> {
+    pub fn equipped_item(&self, slot: EquipmentSlot) -> Option<&ItemQuantity> {
         self.equipment.get(slot as usize).and_then(Option::as_ref)
+    }
+
+    pub fn equipment_stats(&self, registry: &item::Registry) -> item::Stats {
+        self.equipment
+            .iter()
+            .fold(item::Stats::default(), |mut acc, item| {
+                let Some(stats) = item
+                    .as_ref()
+                    .and_then(|item| registry.get(item.0))
+                    .and_then(|item| item.stats.as_ref())
+                else {
+                    return acc;
+                };
+
+                acc.stab_attack += stats.stab_attack;
+                acc.slash_attack += stats.slash_attack;
+                acc.crush_attack += stats.crush_attack;
+                acc.magic_attack += stats.magic_attack;
+                acc.ranged_attack += stats.ranged_attack;
+                acc.stab_defence += stats.stab_defence;
+                acc.slash_defence += stats.slash_defence;
+                acc.crush_defence += stats.crush_defence;
+                acc.magic_defence += stats.magic_defence;
+                acc.ranged_defence += stats.ranged_defence;
+                acc.melee_strength += stats.melee_strength;
+                acc.ranged_strength += stats.ranged_strength;
+                acc.magic_damage += stats.magic_damage;
+                acc.prayer += stats.prayer;
+                acc.attack_speed += stats.attack_speed;
+
+                acc
+            })
     }
 
     fn next_tick(&self) -> Self {
         Self {
+            tick: self.tick + 1,
             attack_state: match self.attack_state {
                 AttackState::OnCooldown(1) => AttackState::Idle,
                 AttackState::OnCooldown(ticks) => AttackState::OnCooldown(ticks - 1),
@@ -364,11 +567,11 @@ impl PlayerState {
                 let index = slot as usize;
 
                 match self.equipment.get_mut(index).and_then(Option::as_mut) {
-                    Some(item) if item.id == id => {
-                        item.quantity += quantity;
+                    Some(item) if item.0 == id => {
+                        item.1 += quantity;
                     }
                     Some(_) | None => {
-                        self.equipment[index] = Some(Item { id, quantity });
+                        self.equipment[index] = Some(ItemQuantity(id, quantity));
                     }
                 }
             }
@@ -376,11 +579,11 @@ impl PlayerState {
                 let index = slot as usize;
 
                 match self.equipment.get_mut(index).and_then(Option::as_mut) {
-                    Some(item) if item.id == id => {
-                        if item.quantity <= quantity {
+                    Some(item) if item.0 == id => {
+                        if item.1 <= quantity {
                             self.equipment[index] = None;
                         } else {
-                            item.quantity -= quantity;
+                            item.1 -= quantity;
                         }
                     }
                     Some(_) | None => {
@@ -417,12 +620,6 @@ impl PlayerState {
 }
 
 #[derive(Debug, Clone)]
-pub struct Item {
-    pub id: i32,
-    pub quantity: i32,
-}
-
-#[derive(Debug, Clone)]
 pub struct SkillLevel {
     pub base: i16,
     pub current: i16,
@@ -443,55 +640,9 @@ impl From<u32> for SkillLevel {
     }
 }
 
-/// Slots in which a player can equip items.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[repr(usize)]
-pub enum EquipmentSlot {
-    Head = blert::event::player::EquipmentSlot::Head as usize,
-    Cape = blert::event::player::EquipmentSlot::Cape as usize,
-    Amulet = blert::event::player::EquipmentSlot::Amulet as usize,
-    Ammo = blert::event::player::EquipmentSlot::Ammo as usize,
-    Weapon = blert::event::player::EquipmentSlot::Weapon as usize,
-    Torso = blert::event::player::EquipmentSlot::Torso as usize,
-    Shield = blert::event::player::EquipmentSlot::Shield as usize,
-    Legs = blert::event::player::EquipmentSlot::Legs as usize,
-    Gloves = blert::event::player::EquipmentSlot::Gloves as usize,
-    Boots = blert::event::player::EquipmentSlot::Boots as usize,
-    Ring = blert::event::player::EquipmentSlot::Ring as usize,
-}
-
-impl From<blert::event::player::EquipmentSlot> for EquipmentSlot {
-    fn from(slot: blert::event::player::EquipmentSlot) -> Self {
-        match slot {
-            blert::event::player::EquipmentSlot::Head => EquipmentSlot::Head,
-            blert::event::player::EquipmentSlot::Cape => EquipmentSlot::Cape,
-            blert::event::player::EquipmentSlot::Amulet => EquipmentSlot::Amulet,
-            blert::event::player::EquipmentSlot::Ammo => EquipmentSlot::Ammo,
-            blert::event::player::EquipmentSlot::Weapon => EquipmentSlot::Weapon,
-            blert::event::player::EquipmentSlot::Torso => EquipmentSlot::Torso,
-            blert::event::player::EquipmentSlot::Shield => EquipmentSlot::Shield,
-            blert::event::player::EquipmentSlot::Legs => EquipmentSlot::Legs,
-            blert::event::player::EquipmentSlot::Gloves => EquipmentSlot::Gloves,
-            blert::event::player::EquipmentSlot::Boots => EquipmentSlot::Boots,
-            blert::event::player::EquipmentSlot::Ring => EquipmentSlot::Ring,
-        }
-    }
-}
-
-impl TryFrom<u64> for EquipmentSlot {
-    type Error = u64;
-
-    fn try_from(value: u64) -> std::result::Result<Self, Self::Error> {
-        let value32 = i32::try_from(value).map_err(|_| value)?;
-        blert::event::player::EquipmentSlot::try_from(value32)
-            .map(Self::from)
-            .map_err(|_| value)
-    }
-}
-
 /// An `ItemDelta` represents a change in the quantity of an item in some
 /// container, such as a player's inventory or equipment.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ItemDelta {
     Add(EquipmentSlot, i32, i32),
     Remove(EquipmentSlot, i32, i32),
@@ -586,7 +737,7 @@ impl PrayerSet {
         Self { prayers: 0 }
     }
 
-    pub fn is_active(&self, prayer: Prayer) -> bool {
+    pub fn is_active(self, prayer: Prayer) -> bool {
         self.prayers & (1 << prayer as u64) != 0
     }
 }
@@ -594,6 +745,38 @@ impl PrayerSet {
 impl From<u64> for PrayerSet {
     fn from(raw: u64) -> Self {
         PrayerSet::from_raw(raw)
+    }
+}
+
+pub trait PlayerAttackExt {
+    fn is_barrage(&self) -> bool;
+    fn is_chin(&self) -> bool;
+}
+
+impl PlayerAttackExt for blert::PlayerAttack {
+    fn is_barrage(&self) -> bool {
+        matches!(
+            self,
+            blert::PlayerAttack::UnknownBarrage
+                | blert::PlayerAttack::KodaiBarrage
+                | blert::PlayerAttack::NmStaffBarrage
+                | blert::PlayerAttack::SangBarrage
+                | blert::PlayerAttack::SceptreBarrage
+                | blert::PlayerAttack::ShadowBarrage
+                | blert::PlayerAttack::SotdBarrage
+                | blert::PlayerAttack::ToxicTridentBarrage
+                | blert::PlayerAttack::ToxicStaffBarrage
+                | blert::PlayerAttack::TridentBarrage
+        )
+    }
+
+    fn is_chin(&self) -> bool {
+        matches!(
+            self,
+            blert::PlayerAttack::ChinBlack
+                | blert::PlayerAttack::ChinGrey
+                | blert::PlayerAttack::ChinRed
+        )
     }
 }
 
