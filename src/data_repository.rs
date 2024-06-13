@@ -96,6 +96,7 @@ impl DataRepository {
 #[derive(Debug)]
 pub enum Error {
     NotFound(String),
+    Backend(String),
     Decode(prost::DecodeError),
 }
 
@@ -128,5 +129,47 @@ impl Backend for FilesystemBackend {
     async fn read_file(&self, relative_path: String) -> Result<Vec<u8>, Error> {
         let full_path = self.root.join(relative_path);
         fs::read(&full_path).map_err(|_| Error::NotFound(full_path.to_string_lossy().into()))
+    }
+}
+
+#[derive(Debug)]
+pub struct S3Backend {
+    bucket: String,
+    client: aws_sdk_s3::Client,
+}
+
+impl S3Backend {
+    pub async fn init(endpoint: &str, bucket: &str) -> Self {
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .endpoint_url(endpoint)
+            .load()
+            .await;
+        let client = aws_sdk_s3::Client::new(&config);
+
+        Self {
+            bucket: bucket.to_owned(),
+            client,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Backend for S3Backend {
+    async fn read_file(&self, relative_path: String) -> Result<Vec<u8>, Error> {
+        let object = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&relative_path)
+            .send()
+            .await
+            .map_err(|_| Error::NotFound(relative_path))?;
+
+        let object = object
+            .body
+            .collect()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        Ok(object.to_vec())
     }
 }

@@ -5,7 +5,7 @@ use challenge::Challenge;
 use std::env;
 use uuid::Uuid;
 
-use data_repository::{DataRepository, FilesystemBackend};
+use data_repository::{DataRepository, FilesystemBackend, S3Backend};
 use error::{Error, Result};
 
 mod analysis;
@@ -19,6 +19,10 @@ mod blert {
     include!(concat!(env!("OUT_DIR"), "/blert.rs"));
 }
 
+fn var(name: &'static str) -> Result<String> {
+    env::var(name).map_err(|_| Error::Environment(name))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -28,9 +32,9 @@ async fn main() -> Result<()> {
         .map(|s| Uuid::parse_str(&s).unwrap())
         .expect("expected UUID as first argument");
 
-    let repository = initialize_data_repository()?;
+    let repository = initialize_data_repository().await?;
     let database_pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&env::var("BLERT_DATABASE_URI").expect("BLERT_DATABASE_URI not set"))
+        .connect(&var("BLERT_DATABASE_URI")?)
         .await?;
 
     let mut analysis_engine = analysis::Engine::load_from_directory("./programs").await?;
@@ -45,15 +49,19 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn initialize_data_repository() -> Result<data_repository::DataRepository> {
-    let uri = env::var("BLERT_DATA_REPOSITORY")
-        .map_err(|_| Error::Environment("BLERT_DATA_REPOSITORY"))?;
+async fn initialize_data_repository() -> Result<DataRepository> {
+    use data_repository::Backend;
 
-    let backend = match uri.split_once("://") {
-        Some(("file", path)) => FilesystemBackend::new(std::path::Path::new(path)),
-        Some(("s3", _)) => unimplemented!(),
+    let uri = var("BLERT_DATA_REPOSITORY")?;
+
+    let backend: Box<dyn Backend + Sync + 'static> = match uri.split_once("://") {
+        Some(("file", path)) => Box::new(FilesystemBackend::new(std::path::Path::new(path))),
+        Some(("s3", bucket)) => {
+            let endpoint = var("BLERT_S3_ENDPOINT")?;
+            Box::new(S3Backend::init(&endpoint, bucket).await)
+        }
         Some((_, _)) | None => return Err(Error::Environment("BLERT_DATA_REPOSITORY")),
     };
 
-    Ok(DataRepository::new(Box::new(backend)))
+    Ok(DataRepository::new(backend))
 }
