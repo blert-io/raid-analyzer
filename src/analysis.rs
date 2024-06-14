@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use futures::future::{self, TryFutureExt};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::sync::mpsc;
@@ -145,8 +146,8 @@ struct WorkerRunResponse {
     result: Result<()>,
 }
 
-struct ProgramRun<'a> {
-    program: &'a ProgramConfig,
+struct ProgramRun {
+    program: Arc<ProgramConfig>,
     run_number: u32,
     level: Level,
     analyzers_to_run: u32,
@@ -159,9 +160,9 @@ struct ProgramRun<'a> {
     challenge: Arc<Challenge>,
 }
 
-impl<'a> ProgramRun<'a> {
+impl ProgramRun {
     fn new(
-        program: &'a ProgramConfig,
+        program: Arc<ProgramConfig>,
         run_number: u32,
         level: Level,
         dispatch_tx: async_channel::Sender<WorkerRunRequest>,
@@ -183,6 +184,10 @@ impl<'a> ProgramRun<'a> {
             completed: Arc::new(RwLock::new(HashMap::new())),
             challenge: Arc::new(challenge),
         }
+    }
+
+    fn program_name(&self) -> &str {
+        &self.program.program.name
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -271,9 +276,10 @@ impl<'a> ProgramRun<'a> {
     }
 }
 
-impl<'a> std::fmt::Debug for ProgramRun<'a> {
+impl std::fmt::Debug for ProgramRun {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("ProgramRun")
+            .field("program", &self.program)
             .field("run_number", &self.run_number)
             .field("level", &self.level)
             .field("analyzers_to_run", &self.analyzers_to_run)
@@ -292,7 +298,7 @@ impl<'a> std::fmt::Debug for ProgramRun<'a> {
 }
 
 pub struct Engine {
-    programs: HashMap<String, ProgramConfig>,
+    programs: HashMap<String, Arc<ProgramConfig>>,
     workers: Vec<JoinHandle<()>>,
     dispatch_tx: Option<async_channel::Sender<WorkerRunRequest>>,
     num_programs_run: u32,
@@ -315,7 +321,7 @@ impl Engine {
             let program: ProgramConfig =
                 toml::from_str(&config).map_err(|_| Error::IncompleteData)?;
 
-            programs.insert(program.program.name.clone(), program);
+            programs.insert(program.program.name.clone(), Arc::new(program));
         }
 
         Ok(Self {
@@ -339,12 +345,7 @@ impl Engine {
     /// Runs an analysis program on a challenge, at the specified level.
     ///
     /// [`start`](#method.start) must have been called before this method, or it will fail.
-    pub async fn run_program(
-        &mut self,
-        program: &str,
-        level: Level,
-        challenge: Challenge,
-    ) -> Result<()> {
+    pub fn run_program(&mut self, program: &str, level: Level, challenge: Challenge) -> Result<()> {
         let Some(program) = self.programs.get(program) else {
             return Err(Error::InvalidArgument);
         };
@@ -361,14 +362,20 @@ impl Engine {
         );
 
         self.num_programs_run += 1;
-        let mut program_run = ProgramRun::new(
-            program,
-            self.num_programs_run,
-            level,
-            dispatch_tx,
-            challenge,
-        );
-        program_run.run().await
+
+        let run_number = self.num_programs_run;
+
+        let mut program_run =
+            ProgramRun::new(program.clone(), run_number, level, dispatch_tx, challenge);
+
+        tokio::spawn(async move {
+            let result = program_run.run().await;
+            if let Err(e) = result {
+                log::error!(r#"Program "{}" failed: {e:?}"#, program_run.program_name());
+            }
+        });
+
+        Ok(())
     }
 }
 

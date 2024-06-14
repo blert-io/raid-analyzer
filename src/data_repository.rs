@@ -9,13 +9,13 @@ use uuid::Uuid;
 use crate::blert;
 
 pub struct DataRepository {
-    backend: Box<dyn Backend + Sync>,
+    backend: Box<dyn Backend + Sync + Send>,
 }
 
 impl DataRepository {
     const CHALLENGE_FILE_NAME: &'static str = "challenge";
 
-    pub fn new(backend: Box<dyn Backend + Sync>) -> Self {
+    pub fn new(backend: Box<dyn Backend + Sync + Send>) -> Self {
         Self { backend }
     }
 
